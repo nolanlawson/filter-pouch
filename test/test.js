@@ -16,9 +16,10 @@ chai.use(require("chai-as-promised"));
 var should = chai.should();
 var Promise = require('lie');
 
-var dbs = 'testdb,http://localhost:5984/testdb';
+var COUCH_URL = process.env.COUCH_URL || 'http://localhost:5984';
+var DB_NAME = 'testdb';
 
-dbs.split(',').forEach(function (db) {
+[DB_NAME, COUCH_URL + '/' + DB_NAME].forEach(function (db) {
   var dbType = /^http/.test(db) ? 'http' : 'local';
   tests(db, dbType);
 });
@@ -609,13 +610,20 @@ function tests(dbName, dbType) {
           return doc;
         }
       });
-      var mapFun = {
-        map: function (doc) {
-          emit(doc._id);
+
+      var ddoc = {
+        _id: '_design/index',
+        views: {
+          index: {
+            map: function (doc) {
+              emit(doc._id);
+            }.toString()
+          }
         }
       };
-      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}]}).then(function () {
-        return db.query(mapFun, {include_docs: true}).then(function (res) {
+
+      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}, ddoc]}).then(function () {
+        return db.query('index', {include_docs: true}).then(function (res) {
           res.rows.should.have.length(2);
           res.rows[0].doc.foo.should.equal('lala_baz');
           res.rows[1].doc.foo.should.equal('toto_baz');
@@ -630,13 +638,18 @@ function tests(dbName, dbType) {
           return doc;
         }
       });
-      var mapFun = {
-        map: function (doc) {
-          emit(doc._id);
+      var ddoc = {
+        _id: '_design/index',
+        views: {
+          index: {
+            map: function (doc) {
+              emit(doc._id);
+            }.toString()
+          }
         }
       };
-      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}]}).then(function () {
-        return db.query(mapFun, {include_docs: true}).then(function (res) {
+      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}, ddoc]}).then(function () {
+        return db.query('index', {include_docs: true}).then(function (res) {
           res.rows.should.have.length(2);
           res.rows[0].doc.foo.should.equal('lala_baz');
           res.rows[1].doc.foo.should.equal('toto_baz');
@@ -651,13 +664,18 @@ function tests(dbName, dbType) {
           return doc;
         }
       });
-      var mapFun = {
-        map: function (doc) {
-          emit(doc._id);
+      var ddoc = {
+        _id: '_design/index',
+        views: {
+          index: {
+            map: function (doc) {
+              emit(doc._id);
+            }.toString()
+          }
         }
       };
-      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}]}).then(function () {
-        return db.query(mapFun).then(function (res) {
+      return db.bulkDocs({docs: [{_id: 'toto'}, {_id: 'lala'}, ddoc]}).then(function () {
+        return db.query('index').then(function (res) {
           res.rows.should.have.length(2);
           should.not.exist(res.rows[0].doc);
           should.not.exist(res.rows[1].doc);
@@ -721,14 +739,23 @@ function tests(dbName, dbType) {
     function transform(db) {
       db.transform({
         incoming: function (doc) {
-          Object.keys(doc).forEach(function (field) {
-            if (field !== '_id' && field !== '_rev') {
-              doc[field] = encrypt(doc[field]);
-            }
-          });
+          // designDocs should be ignored
+          // the !doc._id check is for a db.post (without an id)
+          if (!doc._id || doc._id && !doc._id.startsWith('_design')) {
+            Object.keys(doc).forEach(function (field) {
+              if (field !== '_id' && field !== '_rev') {
+                doc[field] = encrypt(doc[field]);
+              }
+            });
+          }
           return doc;
         },
         outgoing: function (doc) {
+          // designDocs should be ignored
+          if (doc._id && doc._id.startsWith('_design')) {
+            return doc;
+          }
+
           Object.keys(doc).forEach(function (field) {
             if (field !== '_id' && field !== '_rev') {
               doc[field] = decrypt(doc[field]);
@@ -782,18 +809,23 @@ function tests(dbName, dbType) {
     it('test encryption/decryption with bulkdocs/query', function () {
       transform(db);
 
-      var mapFun = {
-        map: function (doc) {
-          emit(doc._id);
+      var ddoc = {
+        _id: '_design/index',
+        views: {
+          index: {
+            map: function (doc) {
+              emit(doc._id);
+            }.toString()
+          }
         }
       };
 
-      return db.bulkDocs([{_id: 'doc', secret: 'my super secret text!'}]).then(function () {
-        return db.query(mapFun, {keys: ['doc'], include_docs: true});
+      return db.bulkDocs([ {_id: 'doc', secret: 'my super secret text!'}, ddoc]).then(function () {
+        return db.query('index', {keys: ['doc'], include_docs: true});
       }).then(function (res) {
         res.rows.should.have.length(1);
         res.rows[0].doc.secret.should.equal('my super secret text!');
-        return new Pouch(dbName).query(mapFun, {keys: ['doc'], include_docs: true});
+        return new Pouch(dbName).query('index', {keys: ['doc'], include_docs: true});
       }).then(function (res) {
         res.rows.should.have.length(1);
         res.rows[0].doc.secret.should.equal(encrypt('my super secret text!'));
@@ -934,8 +966,21 @@ function tests(dbName, dbType) {
     var db;
     var remote;
 
-    beforeEach(function () {
+    // Utility function - complex test incoming
+    var defer = function () {
+    var resolve, reject;
+    var promise = new Promise(function () {
+        resolve = arguments[0];
+        reject = arguments[1];
+      });
+    return {
+        resolve: resolve,
+        reject: reject,
+        promise: promise
+      };
+    };
 
+    beforeEach(function () {
       db = new Pouch(dbName);
       remote = new Pouch(dbName + '_other');
     });
@@ -982,6 +1027,80 @@ function tests(dbName, dbType) {
       }).then(function (doc) {
         doc.foo.should.equal('baz');
       });
+    });
+
+    it('test live replication transforms', function () {
+      // We need to wait until the "incoming" change has happened.
+      // We'll use a re-assignable deferred object so we can wait multiple times
+      var d;
+
+      db.transform({
+        incoming: function (doc) {
+          doc.foo = 'baz';
+          // Resolve anything that's waiting for the incoming handler to finish
+          setTimeout(function () {
+            d.resolve();
+          }, 100);
+          return doc;
+        },
+        outgoing: function (doc) {
+          doc.boo = 'lal';
+          // Resolve anything that's waiting for the outgoing handler to finish
+          setTimeout(function () {
+            d.resolve();
+          }, 100);
+          return doc;
+        }
+      });
+
+      // Ongoing live replication
+      var syncHandler = remote.sync(db,  {
+        live: true
+      });
+
+      var setupPromise = new Promise(function (resolve) {
+        // Wait to give replication a chance
+        setTimeout(resolve, 500);
+      });
+
+
+      // The actual test
+      var result = setupPromise.then(function () {
+        // Reset the incoming listener
+        d = defer();
+        return remote.put({_id: 'doc'});
+      }).then(function () {
+        // Wait for the incoming listener - everything's updated
+        return d.promise;
+      }).then(function () {
+        return db.get('doc');
+      }).then(function (doc) {
+        doc.should.have.property('boo');
+        doc.should.have.property('foo');
+        doc.foo.should.equal('baz');
+        return remote.get('doc');
+      }).then(function (doc) {
+        // Reset the incoming listener
+        d = defer();
+        return remote.put({_id: 'doc', _rev: doc._rev, moo: 'bar' });
+      }).then(function () {
+        // Wait for the incoming listener - everything's updated
+        return d.promise;
+      }).then(function () {
+        return db.get('doc');
+      }).then(function (doc) {
+        doc.should.have.property('moo');
+        doc.should.have.property('foo');
+        doc.should.have.property('boo');
+        doc.foo.should.equal('baz');
+        doc.moo.should.equal('bar');
+        doc.boo.should.equal('lal');
+      });
+
+      result.then(function () {
+        syncHandler.cancel();
+      });
+    return result;
     });
   });
 }
